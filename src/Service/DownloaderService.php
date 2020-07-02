@@ -7,6 +7,7 @@ use GuzzleHttp\TransferStats;
 use GuzzleHttp\Exception\ClientException;
 use Symfony\Component\Console\Style\SymfonyStyle;
 use Symfony\Component\DomCrawler\Crawler;
+use GuzzleHttp\Cookie\CookieJar;
 
 class DownloaderService
 {
@@ -21,6 +22,8 @@ class DownloaderService
     /** @var Client $client */
     private $client;
 
+    private $cookieJar;
+
     /**
      * @param SymfonyStyle $io
      * @param array        $configs
@@ -33,6 +36,10 @@ class DownloaderService
             'base_uri' => $this->configs['URL'],
             'cookies' => true
         ]);
+
+        $this->cookieJar = CookieJar::fromArray([
+            'PHPSESSID' => 'PHPSESSID COOKIE VALUE HERE'
+        ], 'symfonycasts.com');
     }
 
     /**
@@ -84,49 +91,57 @@ class DownloaderService
                 $this->io->section("Chapter '{$this->dashesToTitle($name)}' ({$chaptersCounter} of {$chaptersCount})");
 
                 try {
-                    $response = $this->client->get($url);
+                    $response = $this->client->get($url, ['cookies' => $this->cookieJar]);
                 } catch (ClientException $e) {
                     $this->io->error($e->getMessage());
 
                     continue;
                 }
 
-                $crawler = new Crawler($response->getBody()->getContents());
-                foreach ($crawler->filter('[aria-labelledby="downloadDropdown"] > a') as $i => $a) {
-                    $url = $a->getAttribute('href');
-                    $fileName = false;
-                    switch ($url) {
-                        case (false !== strpos($url, 'video')):
-                            $fileName = sprintf('%03d', $chaptersCounter) . "-{$name}.mp4";
-                            break;
-                        case (false !== strpos($url, 'script')):
-                            $fileName = sprintf('%03d', $chaptersCounter) . "-{$name}-script.pdf";
-                            break;
+                $resp = $response->getBody()->getContents();
+                $p0 = explode("aria-labelledby=\"downloadDropdown\"", $resp)[1];
+                $spans = explode("</div>", $p0)[0];
+                $urlslist = explode("<span", $spans);
+                foreach ($urlslist as $spancont) {
+                    @$href = explode('href="', $spancont)[1];
+                    if (strlen($href) > 10) {
+                        $url = explode('"', $href)[0];
+                        switch ($url) {
+                            case (false !== strpos($url, 'video')):
+                                $fileName = sprintf('%03d', $chaptersCounter) . "-{$name}.mp4";
+                                break;
+                            case (false !== strpos($url, 'script')):
+                                $fileName = sprintf('%03d', $chaptersCounter) . "-{$name}-script.pdf";
+                                break;
                             case (false !== strpos($url, 'code')):
-                            $fileName = sprintf('%03d', $chaptersCounter) . "-{$name}-code.zip";
-                            break;
-                        default:
-                            $this->io->warning('Unkown Link Type: ' . $url);
+                                $fileName = sprintf('%03d', $chaptersCounter) . "-{$name}-code.zip";
+                                break;
+                            default:
+                                $this->io->warning('Unkown Link Type: ' . $url);
+                        }
+
+                        if (!$fileName) {
+                            $this->io->warning('Unable to get download links');
+                            continue;
+                        }
+
+                        if (file_exists("{$coursePath}/{$fileName}")) {
+                            $this->io->writeln("File '{$fileName}' was already downloaded");
+
+                            continue;
+                        }
+
+                        $this->downloadFile($url, $coursePath, $fileName);
+                        $this->io->newLine();
+                    } else {
+                        $url = "";
                     }
 
-                    if (!$fileName) {
-                        $this->io->warning('Unable to get download links');
-                        continue;
-                    }
-
-                    if (file_exists("{$coursePath}/{$fileName}")) {
-                        $this->io->writeln("File '{$fileName}' was already downloaded");
-
-                        continue;
-                    }
-
-                    $this->downloadFile($a->getAttribute('href'), $coursePath, $fileName);
-                    $this->io->newLine();
                 }
-            }
-        }
 
-        $this->io->success('Finished');
+            }
+            $this->io->success('Finished');
+        }
     }
 
     /**
@@ -144,6 +159,7 @@ class DownloaderService
 
         try {
             $this->client->get($url, [
+                'cookies' => $this->cookieJar,
                 'save_to' => $file,
                 'allow_redirects' => ['max' => 2],
                 'auth' => ['username', 'password'],
@@ -203,7 +219,7 @@ class DownloaderService
             return json_decode(file_get_contents($blueprintFile), true);
         }
 
-        $response = $this->client->get('/courses/filtering');
+        $response = $this->client->get('/courses/filtering', ['cookies' => $this->cookieJar]);
 
         $courses = [];
         $crawler = new Crawler($response->getBody()->getContents());
@@ -222,7 +238,7 @@ class DownloaderService
             $progressBar->advance();
 
             $chapters = [];
-            $response = $this->client->get($courseUri);
+            $response = $this->client->get($courseUri, ['cookies' => $this->cookieJar]);
             $crawler = new Crawler($response->getBody()->getContents());
             foreach ($crawler->filter('ul.chapter-list > li > a') as $a) {
                 if ($a->getAttribute('href') === '#') {
@@ -252,35 +268,7 @@ class DownloaderService
      */
     private function login(): void
     {
-        $response = $this->client->get('login');
 
-        $csrfToken = '';
-        $crawler = new Crawler($response->getBody()->getContents());
-        foreach ($crawler->filter('input') as $input) {
-            if ($input->getAttribute('name') === '_csrf_token') {
-                $csrfToken = $input->getAttribute('value');
-            }
-        }
-
-        if (empty($csrfToken)) {
-            throw new \RuntimeException('Unable to authenticate');
-        }
-
-        $currentUrl = null;
-        $this->client->post('login_check', [
-            'form_params' => [
-                '_email' => $this->configs['EMAIL'],
-                '_password' => $this->configs['PASSWORD'],
-                '_csrf_token' => $csrfToken
-            ],
-            'on_stats' => function(TransferStats $stats) use (&$currentUrl) {
-                $currentUrl = $stats->getEffectiveUri();
-            }
-        ]);
-
-        if ((string) $currentUrl !== 'https://symfonycasts.com/') {
-            throw new \RuntimeException('Authorization failed.');
-        }
     }
 
     /**
